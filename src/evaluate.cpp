@@ -25,12 +25,14 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <memory>
 
 #include "nnue/network.h"
 #include "nnue/nnue_misc.h"
 #include "position.h"
 #include "types.h"
 #include "uci.h"
+#include "nnue/nnue_accumulator.h"
 
 namespace Stockfish {
 
@@ -45,29 +47,42 @@ int Eval::simple_eval(const Position& pos, Color c) {
 
 // Evaluate is the evaluator for the outer world. It returns a static evaluation
 // of the position from the point of view of the side to move.
-Value Eval::evaluate(const Eval::NNUE::Networks& networks, const Position& pos, int optimism) {
+Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
+                     const Position&                pos,
+                     Eval::NNUE::AccumulatorCaches& caches,
+                     int                            optimism) {
 
     assert(!pos.checkers());
 
     int  simpleEval = simple_eval(pos, pos.side_to_move());
     bool smallNet   = std::abs(simpleEval) > SmallNetThreshold;
-    bool psqtOnly   = std::abs(simpleEval) > PsqtOnlyThreshold;
+    int  nnueComplexity;
+    int  v;
 
-    int nnueComplexity;
+    Value nnue = smallNet ? networks.small.evaluate(pos, &caches.small, true, &nnueComplexity)
+                          : networks.big.evaluate(pos, &caches.big, true, &nnueComplexity);
 
-    Value nnue = smallNet ? networks.small.evaluate(pos, true, &nnueComplexity, psqtOnly)
-                          : networks.big.evaluate(pos, true, &nnueComplexity, false);
+    if (smallNet && (nnue * simpleEval < 0 || std::abs(nnue) < 500))
+        nnue = networks.big.evaluate(pos, &caches.big, true, &nnueComplexity);
 
-    // Blend optimism and eval with nnue complexity and material imbalance
-    optimism += optimism * (nnueComplexity + std::abs(simpleEval - nnue)) / 524;
-    nnue -= nnue * (nnueComplexity + std::abs(simpleEval - nnue)) / 31950;
+    const auto adjustEval = [&](int nnueDiv, int pawnCountMul, int evalDiv, int shufflingConstant) {
+        // Blend optimism and eval with nnue complexity and material imbalance
+        optimism += optimism * (nnueComplexity + std::abs(simpleEval - nnue)) / 584;
+        nnue -= nnue * (nnueComplexity * 5 / 3) / nnueDiv;
 
-    int npm = pos.non_pawn_material() / 64;
-    int v   = (nnue * (927 + npm + 9 * pos.count<PAWN>()) + optimism * (159 + npm)) / 1000;
+        int npm = pos.non_pawn_material() / 64;
+        v       = (nnue * (npm + 943 + pawnCountMul * pos.count<PAWN>()) + optimism * (npm + 140))
+          / evalDiv;
 
-    // Damp down the evaluation linearly when shuffling
-    int shuffling = pos.rule50_count();
-    v             = v * (195 - shuffling) / 228;
+        // Damp down the evaluation linearly when shuffling
+        int shuffling = pos.rule50_count();
+        v             = v * (shufflingConstant - shuffling) / 207;
+    };
+
+    if (!smallNet)
+        adjustEval(32395, 11, 1058, 178);
+    else
+        adjustEval(32793, 9, 1067, 206);
 
     // Guarantee evaluation does not hit the tablebase range
     v = std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
@@ -84,19 +99,21 @@ std::string Eval::trace(Position& pos, const Eval::NNUE::Networks& networks) {
     if (pos.checkers())
         return "Final evaluation: none (in check)";
 
+    auto caches = std::make_unique<Eval::NNUE::AccumulatorCaches>(networks);
+
     std::stringstream ss;
     ss << std::showpoint << std::noshowpos << std::fixed << std::setprecision(2);
-    ss << '\n' << NNUE::trace(pos, networks) << '\n';
+    ss << '\n' << NNUE::trace(pos, networks, *caches) << '\n';
 
     ss << std::showpoint << std::showpos << std::fixed << std::setprecision(2) << std::setw(15);
 
-    Value v = networks.big.evaluate(pos, false);
+    Value v = networks.big.evaluate(pos, &caches->big, false);
     v       = pos.side_to_move() == WHITE ? v : -v;
-    ss << "NNUE evaluation        " << 0.01 * UCI::to_cp(v) << " (white side)\n";
+    ss << "NNUE evaluation        " << 0.01 * UCIEngine::to_cp(v, pos) << " (white side)\n";
 
-    v = evaluate(networks, pos, VALUE_ZERO);
+    v = evaluate(networks, pos, *caches, VALUE_ZERO);
     v = pos.side_to_move() == WHITE ? v : -v;
-    ss << "Final evaluation       " << 0.01 * UCI::to_cp(v) << " (white side)";
+    ss << "Final evaluation       " << 0.01 * UCIEngine::to_cp(v, pos) << " (white side)";
     ss << " [with scaled NNUE, ...]";
     ss << "\n";
 
